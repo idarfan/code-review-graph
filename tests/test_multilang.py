@@ -1369,6 +1369,142 @@ class TestRubyParsing:
         assert "Helpers" in names
 
 
+    def test_compact_namespace_three_segments(self, tmp_path):
+        """``class A::B::C`` names the class after the rightmost constant.
+
+        The loop walks ``scope_resolution.children`` in reverse, so nesting
+        depth must not change the result: the emitted Class is ``C``, and its
+        methods hang off ``C`` rather than off an intermediate segment.
+        """
+        deep = tmp_path / "deep.rb"
+        deep.write_text(
+            "class Alpha::Beta::Gamma\n"
+            "  def ping\n"
+            "    :ok\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(deep)
+
+        names = {n.name for n in nodes if n.kind == "Class"}
+        assert "Gamma" in names
+        # Intermediate segments are scope, not classes of their own.
+        assert "Alpha" not in names
+        assert "Beta" not in names
+
+        ping = next(
+            n for n in nodes if n.kind == "Function" and n.name == "ping"
+        )
+        assert ping.parent_name == "Gamma"
+
+    def test_compact_namespace_with_superclass(self, tmp_path):
+        """``class Foo::Bar < Base`` still emits Class ``Bar``.
+
+        A superclass adds a further child to the ``class`` node. The name is
+        read from the ``name`` field rather than from child order, so the
+        extra child must not displace it. This is the dominant form in Rails
+        (``class Admin::UsersController < ApplicationController``).
+        """
+        inherited = tmp_path / "inherited.rb"
+        inherited.write_text(
+            "class Base\n"
+            "end\n"
+            "\n"
+            "class Widgets::Themed < Base\n"
+            "  def render\n"
+            "    :ok\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(inherited)
+
+        names = {n.name for n in nodes if n.kind == "Class"}
+        assert "Themed" in names
+
+        render = next(
+            n for n in nodes if n.kind == "Function" and n.name == "render"
+        )
+        assert render.parent_name == "Themed"
+
+    def test_top_level_scope_class(self, tmp_path):
+        """``class ::Foo`` has a ``scope_resolution`` name with no scope child.
+
+        Only the leading ``::`` and the constant are present, so the reverse
+        walk has to reach the sole ``constant`` instead of relying on a
+        preceding scope node.
+        """
+        rooted = tmp_path / "rooted.rb"
+        rooted.write_text(
+            "class ::Standalone\n"
+            "  def ping\n"
+            "    :ok\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(rooted)
+
+        names = {n.name for n in nodes if n.kind == "Class"}
+        assert "Standalone" in names
+
+    def test_compact_namespace_inside_module_keeps_enclosing_parent(
+        self, tmp_path,
+    ):
+        """A compact class nested in a module keeps the module as parent.
+
+        ``_get_name`` only supplies the leaf name; ``parent_name`` still comes
+        from the enclosing scope, so ``module Alpha; class Beta::Gamma`` must
+        report ``Alpha`` and not be overwritten by the ``Beta`` segment.
+        """
+        nested = tmp_path / "nested.rb"
+        nested.write_text(
+            "module Alpha\n"
+            "  class Beta::Gamma\n"
+            "    def ping\n"
+            "      :ok\n"
+            "    end\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(nested)
+
+        gamma = next(
+            n for n in nodes if n.kind == "Class" and n.name == "Gamma"
+        )
+        assert gamma.parent_name == "Alpha"
+
+    def test_scope_resolution_without_constant_is_not_fatal(self):
+        """The fallthrough branch: no ``constant`` child, no crash.
+
+        The reverse walk can complete without a match only on a malformed or
+        error-recovered tree. It must fall through to the generic lookup and
+        return None (no Class node) instead of raising.
+        """
+
+        class _StubNode:
+            def __init__(self, type_, children=(), name_child=None):
+                self.type = type_
+                self.children = list(children)
+                self._name_child = name_child
+
+            def child_by_field_name(self, field):
+                return self._name_child if field == "name" else None
+
+        scope = _StubNode("scope_resolution", children=[_StubNode("::")])
+        class_node = _StubNode("class", children=[scope], name_child=scope)
+
+        assert self.parser._get_name(class_node, "ruby", "class") is None
+
+    def test_malformed_compact_namespace_does_not_crash(self, tmp_path):
+        """An unterminated compact name parses to an error tree, not a crash."""
+        broken = tmp_path / "broken.rb"
+        broken.write_text("class Widgets::\nend\n")
+
+        nodes, _ = self.parser.parse_file(broken)
+
+        # A File node is always emitted; the point is that parsing returns.
+        assert any(n.kind == "File" for n in nodes)
+
+
 class TestPHPParsing:
     def setup_method(self):
         self.parser = CodeParser()
