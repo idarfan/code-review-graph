@@ -10172,6 +10172,30 @@ class CodeParser:
 
         class_parent = enclosing_class
 
+        # Ruby: a compact declaration (``class Foo::Bar``) carries its own
+        # scope, so the enclosing lexical scope is not the whole story. Give
+        # the immediate scope segment to ``parent_name`` so the compact form
+        # lands on the same identity as the nested form: ``class Foo::Bar``
+        # and ``module Foo`` + ``class Bar`` both qualify to ``Foo.Bar``.
+        # Without this, ``class A::Same`` and ``class B::Same`` in one file
+        # collapse onto a single ``file.rb::Same``. Mirrors the nested form's
+        # existing shallowness (immediate scope only, see ``recursive_class``
+        # below) rather than changing it. ``class ::Foo`` has no scope field
+        # and falls through unchanged.
+        if language == "ruby" and child.type in ("class", "module"):
+            _name_child = child.child_by_field_name("name")
+            if _name_child is not None and _name_child.type == "scope_resolution":
+                _scope = _name_child.child_by_field_name("scope")
+                if _scope is not None:
+                    _immediate = (
+                        _scope if _scope.type == "constant"
+                        else _scope.child_by_field_name("name")
+                    )
+                    if _immediate is not None:
+                        class_parent = _immediate.text.decode(
+                            "utf-8", errors="replace",
+                        )
+
         # Swift: detect the actual type keyword (class/struct/enum/actor/extension)
         # and store it in extra["swift_kind"] for richer downstream analysis.
         # Tree-sitter maps struct/enum/actor/extension all to class_declaration;

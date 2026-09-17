@@ -1397,6 +1397,37 @@ class TestRubyParsing:
         )
         assert ping.parent_name == "Gamma"
 
+    def test_compact_namespace_same_leaf_keeps_distinct_identities(
+        self, tmp_path,
+    ):
+        """Two compact classes sharing a leaf must not merge into one node.
+
+        The leaf alone is not an identity: ``class Alpha::Same`` and
+        ``class Beta::Same`` in one file both qualified to ``file.rb::Same``
+        before the scope segment fed ``parent_name``, merging the two classes
+        and attaching both methods to the survivor.
+        """
+        twins = tmp_path / "twins.rb"
+        twins.write_text(
+            "class Alpha::Same\n"
+            "  def a\n"
+            "  end\n"
+            "end\n"
+            "\n"
+            "class Beta::Same\n"
+            "  def b\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(twins)
+
+        same = [n for n in nodes if n.kind == "Class" and n.name == "Same"]
+        assert len(same) == 2
+        assert {n.parent_name for n in same} == {"Alpha", "Beta"}
+
+        identities = {self.parser._node_qualified(n) for n in same}
+        assert len(identities) == 2
+
     def test_compact_namespace_with_superclass(self, tmp_path):
         """``class Foo::Bar < Base`` still emits Class ``Bar``.
 
@@ -1446,14 +1477,16 @@ class TestRubyParsing:
         names = {n.name for n in nodes if n.kind == "Class"}
         assert "Standalone" in names
 
-    def test_compact_namespace_inside_module_keeps_enclosing_parent(
+    def test_compact_namespace_inside_module_uses_immediate_scope(
         self, tmp_path,
     ):
-        """A compact class nested in a module keeps the module as parent.
+        """A compact class nested in a module takes its own scope as parent.
 
-        ``_get_name`` only supplies the leaf name; ``parent_name`` still comes
-        from the enclosing scope, so ``module Alpha; class Beta::Gamma`` must
-        report ``Alpha`` and not be overwritten by the ``Beta`` segment.
+        ``module Alpha; class Beta::Gamma`` reports ``Beta``, not ``Alpha``:
+        the compact name carries its own scope and the immediate segment wins,
+        exactly as the nested equivalent ``module Alpha; module Beta; class
+        Gamma`` reports ``Beta`` and drops ``Alpha``. Taking ``Alpha`` here
+        would discard ``Beta`` and merge same-leaf classes under one module.
         """
         nested = tmp_path / "nested.rb"
         nested.write_text(
@@ -1470,7 +1503,40 @@ class TestRubyParsing:
         gamma = next(
             n for n in nodes if n.kind == "Class" and n.name == "Gamma"
         )
-        assert gamma.parent_name == "Alpha"
+        # The immediate scope wins, matching the nested equivalent
+        # ``module Alpha; module Beta; class Gamma``, which also reports
+        # ``Beta`` and drops ``Alpha``.
+        assert gamma.parent_name == "Beta"
+
+    def test_compact_namespaces_inside_one_module_stay_distinct(self, tmp_path):
+        """Same leaf, different compact scope, one enclosing module.
+
+        Taking the enclosing module as ``parent_name`` would qualify both to
+        ``file.rb::Alpha.Same``. The immediate scope segment is what keeps
+        them apart.
+        """
+        shared = tmp_path / "shared.rb"
+        shared.write_text(
+            "module Alpha\n"
+            "  class Beta::Same\n"
+            "    def b\n"
+            "    end\n"
+            "  end\n"
+            "\n"
+            "  class Gamma::Same\n"
+            "    def c\n"
+            "    end\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(shared)
+
+        same = [n for n in nodes if n.kind == "Class" and n.name == "Same"]
+        assert len(same) == 2
+        assert {n.parent_name for n in same} == {"Beta", "Gamma"}
+
+        identities = {self.parser._node_qualified(n) for n in same}
+        assert len(identities) == 2
 
     def test_scope_resolution_without_constant_is_not_fatal(self):
         """The fallthrough branch: no ``constant`` child, no crash.
