@@ -1315,7 +1315,9 @@ class TestRubyParsing:
 
         # A same-class call resolves to the defining method node, not a bare
         # name, so callers_of/callees_of work within a file.
-        assert any(t.endswith("sample.rb::UserRepository.save") for t in targets)
+        assert any(
+            t.endswith("sample.rb::Auth.UserRepository.save") for t in targets
+        )
 
         # Calls are attributed to their enclosing method.
         create_user_targets = {
@@ -1351,7 +1353,7 @@ class TestRubyParsing:
         render = next(
             n for n in nodes if n.kind == "Function" and n.name == "render"
         )
-        assert render.parent_name == "CompactStyle"
+        assert render.parent_name == "Widgets.CompactStyle"
 
     def test_compact_namespace_module_is_indexed(self, tmp_path):
         """``module Foo::Bar`` goes through the same scope_resolution path."""
@@ -1395,7 +1397,7 @@ class TestRubyParsing:
         ping = next(
             n for n in nodes if n.kind == "Function" and n.name == "ping"
         )
-        assert ping.parent_name == "Gamma"
+        assert ping.parent_name == "Alpha.Beta.Gamma"
 
     def test_compact_namespace_same_leaf_keeps_distinct_identities(
         self, tmp_path,
@@ -1455,7 +1457,7 @@ class TestRubyParsing:
         render = next(
             n for n in nodes if n.kind == "Function" and n.name == "render"
         )
-        assert render.parent_name == "Themed"
+        assert render.parent_name == "Widgets.Themed"
 
     def test_top_level_scope_class(self, tmp_path):
         """``class ::Foo`` has a ``scope_resolution`` name with no scope child.
@@ -1477,16 +1479,17 @@ class TestRubyParsing:
         names = {n.name for n in nodes if n.kind == "Class"}
         assert "Standalone" in names
 
-    def test_compact_namespace_inside_module_uses_immediate_scope(
+    def test_compact_namespace_inside_module_accumulates_scope(
         self, tmp_path,
     ):
-        """A compact class nested in a module takes its own scope as parent.
+        """A compact class nested in a module stacks both scopes.
 
-        ``module Alpha; class Beta::Gamma`` reports ``Beta``, not ``Alpha``:
-        the compact name carries its own scope and the immediate segment wins,
-        exactly as the nested equivalent ``module Alpha; module Beta; class
-        Gamma`` reports ``Beta`` and drops ``Alpha``. Taking ``Alpha`` here
-        would discard ``Beta`` and merge same-leaf classes under one module.
+        ``module Alpha; class Beta::Gamma`` reports ``Alpha.Beta``, the same
+        identity as the nested spelling ``module Alpha; module Beta; class
+        Gamma``. Ruby resolves the ``Beta`` in a compact name by lexical
+        lookup, and the enclosing module is the first place it looks, so
+        stacking is both the likelier reading and the one that makes the two
+        spellings agree.
         """
         nested = tmp_path / "nested.rb"
         nested.write_text(
@@ -1506,7 +1509,7 @@ class TestRubyParsing:
         # The immediate scope wins, matching the nested equivalent
         # ``module Alpha; module Beta; class Gamma``, which also reports
         # ``Beta`` and drops ``Alpha``.
-        assert gamma.parent_name == "Beta"
+        assert gamma.parent_name == "Alpha.Beta"
 
     def test_compact_namespaces_inside_one_module_stay_distinct(self, tmp_path):
         """Same leaf, different compact scope, one enclosing module.
@@ -1533,7 +1536,7 @@ class TestRubyParsing:
 
         same = [n for n in nodes if n.kind == "Class" and n.name == "Same"]
         assert len(same) == 2
-        assert {n.parent_name for n in same} == {"Beta", "Gamma"}
+        assert {n.parent_name for n in same} == {"Alpha.Beta", "Alpha.Gamma"}
 
         identities = {self.parser._node_qualified(n) for n in same}
         assert len(identities) == 2
@@ -1569,6 +1572,98 @@ class TestRubyParsing:
 
         # A File node is always emitted; the point is that parsing returns.
         assert any(n.kind == "File" for n in nodes)
+
+
+    def test_compact_module_class_contains_edge_resolves(self, tmp_path):
+        """An ordinary class inside a compact module keeps a live CONTAINS source.
+
+        The class node is keyed by its qualified identity, so its methods have
+        to descend with that same scope. Descending with the bare leaf pointed
+        the CONTAINS edge at a ``adapters.rb::Stripe`` container that was never
+        emitted: both nodes stayed indexed, the edge dangled, and ``charge``
+        became unreachable from the class that defines it.
+        """
+        adapters = tmp_path / "adapters.rb"
+        adapters.write_text(
+            "module Billing::Adapters\n"
+            "  class Stripe\n"
+            "    def charge(amount)\n"
+            "      amount * 100\n"
+            "    end\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, edges = self.parser.parse_file(adapters)
+
+        stripe = next(
+            n for n in nodes if n.kind == "Class" and n.name == "Stripe"
+        )
+        charge = next(
+            n for n in nodes if n.kind == "Function" and n.name == "charge"
+        )
+        stripe_id = self.parser._node_qualified(stripe)
+        charge_id = self.parser._node_qualified(charge)
+
+        # The method hangs off the class identity, not off a bare leaf.
+        assert charge_id == f"{stripe_id}.charge"
+
+        owning = [
+            e for e in edges if e.kind == "CONTAINS" and e.target == charge_id
+        ]
+        assert len(owning) == 1
+        assert owning[0].source == stripe_id
+
+    def test_compact_namespace_contains_edges_have_no_dangling_source(
+        self, tmp_path,
+    ):
+        """Every CONTAINS source must name a node the same parse emitted.
+
+        A sweep rather than a single case: the identity and the edge are built
+        in two different places, so any compact shape that feeds one but not
+        the other leaves an edge pointing at nothing. Nothing in the suite
+        caught that before, because the tests only ever looked at nodes.
+        """
+        mixed = tmp_path / "mixed.rb"
+        mixed.write_text(
+            "module Billing::Adapters\n"
+            "  class Stripe\n"
+            "    def charge; end\n"
+            "  end\n"
+            "end\n"
+            "\n"
+            "class Admin::User\n"
+            "  def display_name; end\n"
+            "end\n"
+            "\n"
+            "class User\n"
+            "  def display_name; end\n"
+            "end\n"
+            "\n"
+            "module Alpha\n"
+            "  class Beta::Gamma\n"
+            "    def ping; end\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, edges = self.parser.parse_file(mixed)
+
+        identities = {self.parser._node_qualified(n) for n in nodes}
+        file_id = str(mixed)
+
+        dangling = [
+            e.source for e in edges
+            if e.kind == "CONTAINS"
+            and e.source != file_id
+            and e.source not in identities
+        ]
+        assert dangling == []
+
+        # Same leaf under different scopes stays two distinct rows; the
+        # qualified_name column is UNIQUE, so a collision drops one outright.
+        qualified = [
+            self.parser._node_qualified(n) for n in nodes if n.kind == "Function"
+        ]
+        assert len(qualified) == len(set(qualified))
 
 
 class TestPHPParsing:

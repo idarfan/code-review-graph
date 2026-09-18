@@ -10187,14 +10187,12 @@ class CodeParser:
             if _name_child is not None and _name_child.type == "scope_resolution":
                 _scope = _name_child.child_by_field_name("scope")
                 if _scope is not None:
-                    _immediate = (
-                        _scope if _scope.type == "constant"
-                        else _scope.child_by_field_name("name")
+                    _chain = _scope.text.decode(
+                        "utf-8", errors="replace",
+                    ).replace("::", ".")
+                    class_parent = (
+                        f"{class_parent}.{_chain}" if class_parent else _chain
                     )
-                    if _immediate is not None:
-                        class_parent = _immediate.text.decode(
-                            "utf-8", errors="replace",
-                        )
 
         # Swift: detect the actual type keyword (class/struct/enum/actor/extension)
         # and store it in extra["swift_kind"] for richer downstream analysis.
@@ -10321,6 +10319,14 @@ class CodeParser:
         # Recurse into class body
         if language == "julia":
             recursive_class = self._julia_scope_join(enclosing_class, name)
+        elif language == "ruby" and class_parent:
+            # The class node is keyed ``_qualify(name, file, class_parent)``,
+            # i.e. ``file::Parent.Name``. Descend with that same scope string so
+            # its methods qualify to ``file::Parent.Name.method`` and the
+            # CONTAINS edge points at a node that exists. Passing the bare leaf
+            # leaves every class with a parent_name pointing its methods at a
+            # ``file::Name`` container that was never emitted.
+            recursive_class = f"{class_parent}.{name}"
         else:
             recursive_class = name
         self._extract_from_tree(
@@ -14796,9 +14802,15 @@ class CodeParser:
         if language == "ruby" and node.type in ("class", "module"):
             name_child = node.child_by_field_name("name")
             if name_child is not None and name_child.type == "scope_resolution":
-                for sub in reversed(name_child.children):
-                    if sub.type == "constant":
-                        return sub.text.decode("utf-8", errors="replace")
+                # Only a constant scope names a namespace. ``class klass::Inner``
+                # (identifier) and ``class self::Foo`` (self) resolve their scope
+                # at runtime, so there is no static namespace to record -- fall
+                # through and emit nothing, as before this branch existed.
+                scope = name_child.child_by_field_name("scope")
+                if scope is None or scope.type in ("constant", "scope_resolution"):
+                    for sub in reversed(name_child.children):
+                        if sub.type == "constant":
+                            return sub.text.decode("utf-8", errors="replace")
 
         # Most built-in languages use a 'name' child.
         # field_identifier covers C++ class member function names inside
