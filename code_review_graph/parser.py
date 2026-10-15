@@ -11669,23 +11669,29 @@ class CodeParser:
         class_parent = enclosing_class
 
         # Ruby: a compact declaration (``class Foo::Bar``) carries its own
-        # scope, so the enclosing lexical scope is not the whole story. Give
-        # the immediate scope segment to ``parent_name`` so the compact form
-        # lands on the same identity as the nested form: ``class Foo::Bar``
-        # and ``module Foo`` + ``class Bar`` both qualify to ``Foo.Bar``.
-        # Without this, ``class A::Same`` and ``class B::Same`` in one file
-        # collapse onto a single ``file.rb::Same``. Mirrors the nested form's
-        # existing shallowness (immediate scope only, see ``recursive_class``
-        # below) rather than changing it. ``class ::Foo`` has no scope field
-        # and falls through unchanged.
+        # scope, so the enclosing lexical scope is not the whole story. Append
+        # the compact scope chain to the full enclosing scope chain, so the
+        # compact form lands on the same identity as the nested form at any
+        # depth: ``module A; class B::C`` and ``module A; module B; class C``
+        # both qualify to ``A.B.C``. Without this, ``class A::Same`` and
+        # ``class B::Same`` in one file collapse onto a single
+        # ``file.rb::Same``.
+        #
+        # A leading ``::`` (``class ::Root``, ``class ::A::B``) anchors the
+        # name at the top level, so the enclosing scope is dropped instead of
+        # stacked, and the leading separator must not leave an empty segment.
         if language == "ruby" and child.type in ("class", "module"):
             _name_child = child.child_by_field_name("name")
             if _name_child is not None and _name_child.type == "scope_resolution":
                 _scope = _name_child.child_by_field_name("scope")
-                if _scope is not None:
-                    _chain = _scope.text.decode(
-                        "utf-8", errors="replace",
-                    ).replace("::", ".")
+                _chain = (
+                    _scope.text.decode("utf-8", errors="replace").replace("::", ".")
+                    if _scope is not None
+                    else ""
+                ).lstrip(".")
+                if _name_child.text.lstrip().startswith(b"::"):
+                    class_parent = _chain or None
+                elif _chain:
                     class_parent = (
                         f"{class_parent}.{_chain}" if class_parent else _chain
                     )

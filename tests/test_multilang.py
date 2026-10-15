@@ -1528,17 +1528,17 @@ class TestRubyParsing:
         gamma = next(
             n for n in nodes if n.kind == "Class" and n.name == "Gamma"
         )
-        # The immediate scope wins, matching the nested equivalent
+        # Both scopes stack, matching the nested equivalent
         # ``module Alpha; module Beta; class Gamma``, which also reports
-        # ``Beta`` and drops ``Alpha``.
+        # ``Alpha.Beta``.
         assert gamma.parent_name == "Alpha.Beta"
 
     def test_compact_namespaces_inside_one_module_stay_distinct(self, tmp_path):
         """Same leaf, different compact scope, one enclosing module.
 
         Taking the enclosing module as ``parent_name`` would qualify both to
-        ``file.rb::Alpha.Same``. The immediate scope segment is what keeps
-        them apart.
+        ``file.rb::Alpha.Same``. The compact scope segment, stacked on the
+        enclosing module, is what keeps them apart.
         """
         shared = tmp_path / "shared.rb"
         shared.write_text(
@@ -1562,6 +1562,48 @@ class TestRubyParsing:
 
         identities = {self.parser._node_qualified(n) for n in same}
         assert len(identities) == 2
+
+    def test_root_anchored_compact_name_drops_enclosing_scope(self, tmp_path):
+        """A leading ``::`` anchors the name at the top level.
+
+        ``class ::Root`` inside ``module Outer`` defines ``::Root``, not
+        ``Outer::Root``, so the enclosing scope must be dropped, and the
+        leading ``::`` must not leave an empty segment behind (``Outer..A``,
+        ``.X``).
+        """
+        anchored = tmp_path / "anchored.rb"
+        anchored.write_text(
+            "module Outer\n"
+            "  class ::Root\n"
+            "    def r\n"
+            "    end\n"
+            "  end\n"
+            "\n"
+            "  class ::A::B\n"
+            "    def ab\n"
+            "    end\n"
+            "  end\n"
+            "end\n"
+            "\n"
+            "class ::X::Y\n"
+            "  def xy\n"
+            "  end\n"
+            "end\n"
+        )
+        nodes, _ = self.parser.parse_file(anchored)
+
+        classes = {n.name: n for n in nodes if n.kind == "Class"}
+        assert classes["Root"].parent_name is None
+        assert classes["B"].parent_name == "A"
+        assert classes["Y"].parent_name == "X"
+
+        methods = {n.name: n for n in nodes if n.kind == "Function"}
+        assert methods["r"].parent_name == "Root"
+        assert methods["ab"].parent_name == "A.B"
+        assert methods["xy"].parent_name == "X.Y"
+
+        # Same identity as the unanchored spelling at the top level.
+        assert self.parser._node_qualified(classes["B"]).endswith("anchored.rb::A.B")
 
     def test_scope_resolution_without_constant_is_not_fatal(self):
         """The fallthrough branch: no ``constant`` child, no crash.
